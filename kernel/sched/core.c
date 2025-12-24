@@ -95,9 +95,17 @@
 #include "../../io_uring/io-wq.h"
 #include "../smpboot.h"
 
+#ifdef CONFIG_HMBIRD_SCHED
+#include "slim.h"
+#endif
+
 #include <trace/hooks/sched.h>
 #include <trace/hooks/dtask.h>
 #include <trace/hooks/cgroup.h>
+
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+#include <../kernel/oplus_cpu/sched/sched_tune/tune.h>
+#endif
 
 /*
  * Export tracepoints that act as a bare tracehook (ie: have no trace event
@@ -178,7 +186,11 @@ static inline int __task_prio(struct task_struct *p)
 	if (p->sched_class == &idle_sched_class)
 		return MAX_RT_PRIO + NICE_WIDTH; /* 140 */
 
-	return MAX_RT_PRIO + MAX_NICE; /* 120, squash fair */
+#ifdef CONFIG_HMBIRD_SCHED
+	if (p->sched_class == &ext_sched_class)
+		return MAX_RT_PRIO + MAX_NICE + 1; /* 120, squash ext */
+#endif
+	return MAX_RT_PRIO + MAX_NICE; /* 119, squash fair */
 }
 
 /*
@@ -205,6 +217,11 @@ static inline bool prio_less(struct task_struct *a, struct task_struct *b, bool 
 
 	if (pa == MAX_RT_PRIO + MAX_NICE)	/* fair */
 		return cfs_prio_less(a, b, in_fi);
+
+#ifdef CONFIG_HMBIRD_SCHED
+	if (pa == MAX_RT_PRIO + MAX_NICE + 1)	/* ext */
+		return scx_prio_less(a, b, in_fi);
+#endif
 
 	return false;
 }
@@ -721,7 +738,6 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
 
 	rq->prev_irq_time += irq_delta;
 	delta -= irq_delta;
-	psi_account_irqtime(rq->curr, irq_delta);
 #endif
 #ifdef CONFIG_PARAVIRT_TIME_ACCOUNTING
 	if (static_key_false((&paravirt_steal_rq_enabled))) {
@@ -1043,11 +1059,15 @@ void wake_up_q(struct wake_q_head *head)
 void resched_curr(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
-	int cpu;
+	int cpu, need_lazy = 0;
 
 	lockdep_assert_rq_held(rq);
 
 	if (test_tsk_need_resched(curr))
+		return;
+
+	trace_android_vh_set_tsk_need_resched_lazy(curr, rq, &need_lazy);
+	if (need_lazy)
 		return;
 
 	cpu = cpu_of(rq);
@@ -1229,6 +1249,18 @@ bool sched_can_stop_tick(struct rq *rq)
 	if (fifo_nr_running)
 		return true;
 
+#ifdef CONFIG_HMBIRD_SCHED
+	/*
+	 * If there are no DL,RR/FIFO tasks, there must only be CFS or SCX tasks
+	 * left. For CFS, if there's more than one we need the tick for
+	 * involuntary preemption. For SCX, ask.
+	 */
+	if (!scx_enabled() && rq->nr_running > 1)
+		return false;
+
+	if (scx_enabled() && !scx_can_stop_tick(rq))
+		return false;
+#else
 	/*
 	 * If there are no DL,RR/FIFO tasks, there must only be CFS tasks left;
 	 * if there's more than one we need the tick for involuntary
@@ -1236,6 +1268,7 @@ bool sched_can_stop_tick(struct rq *rq)
 	 */
 	if (rq->nr_running > 1)
 		return false;
+#endif
 
 	return true;
 }
@@ -2156,6 +2189,42 @@ void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
 	dequeue_task(rq, p, flags);
 }
 EXPORT_SYMBOL_GPL(deactivate_task);
+
+#ifdef CONFIG_HMBIRD_SCHED
+struct sched_change_guard
+sched_change_guard_init(struct rq *rq, struct task_struct *p, int flags)
+{
+	struct sched_change_guard cg = {
+		.rq = rq,
+		.p = p,
+		.queued = task_on_rq_queued(p),
+		.running = task_current(rq, p),
+	};
+
+	if (cg.queued) {
+		/*
+		 * __kthread_bind() may call this on blocked tasks without
+		 * holding rq->lock through __do_set_cpus_allowed(). Assert @rq
+		 * locked iff @p is queued.
+		 */
+		lockdep_assert_rq_held(rq);
+		dequeue_task(rq, p, flags);
+	}
+	if (cg.running)
+		put_prev_task(rq, p);
+
+	return cg;
+}
+
+void sched_change_guard_fini(struct sched_change_guard *cg, int flags)
+{
+	if (cg->queued)
+		enqueue_task(cg->rq, cg->p, flags | ENQUEUE_NOCLOCK);
+	if (cg->running)
+		set_next_task(cg->rq, cg->p);
+	cg->done = true;
+}
+#endif
 
 static inline int __normal_prio(int policy, int rt_prio, int nice)
 {
@@ -3657,7 +3726,11 @@ int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
 	 * [ this allows ->select_task() to simply return task_cpu(p) and
 	 *   not worry about this generic constraint ]
 	 */
+#ifdef CONFIG_HMBIRD_SCHED
+	if (unlikely(!is_cpu_allowed(p, cpu)) && (p->sched_class != &ext_sched_class))
+#else
 	if (unlikely(!is_cpu_allowed(p, cpu)))
+#endif
 		cpu = select_fallback_rq(task_cpu(p), p);
 
 	return cpu;
@@ -3954,6 +4027,17 @@ out:
 	rcu_read_unlock();
 }
 EXPORT_SYMBOL_GPL(wake_up_if_idle);
+
+bool cpus_equal_capacity(int this_cpu, int that_cpu)
+{
+	if (!sched_asym_cpucap_active())
+		return true;
+
+	if (this_cpu == that_cpu)
+		return true;
+
+	return arch_scale_cpu_capacity(this_cpu) == arch_scale_cpu_capacity(that_cpu);
+}
 
 bool cpus_share_cache(int this_cpu, int that_cpu)
 {
@@ -4463,12 +4547,7 @@ int task_call_func(struct task_struct *p, task_call_f func, void *arg)
  * @cpu: The CPU on which to snapshot the task.
  *
  * Returns the task_struct pointer of the task "currently" running on
- * the specified CPU.  If the same task is running on that CPU throughout,
- * the return value will be a pointer to that task's task_struct structure.
- * If the CPU did any context switches even vaguely concurrently with the
- * execution of this function, the return value will be a pointer to the
- * task_struct structure of a randomly chosen task that was running on
- * that CPU somewhere around the time that this function was executing.
+ * the specified CPU.
  *
  * If the specified CPU was offline, the return value is whatever it
  * is, perhaps a pointer to the task_struct structure of that CPU's idle
@@ -4482,11 +4561,16 @@ int task_call_func(struct task_struct *p, task_call_f func, void *arg)
  */
 struct task_struct *cpu_curr_snapshot(int cpu)
 {
+	struct rq *rq = cpu_rq(cpu);
 	struct task_struct *t;
+	struct rq_flags rf;
 
-	smp_mb(); /* Pairing determined by caller's synchronization design. */
+	rq_lock_irqsave(rq, &rf);
+	smp_mb__after_spinlock(); /* Pairing determined by caller's synchronization design. */
 	t = rcu_dereference(cpu_curr(cpu));
+	rq_unlock_irqrestore(rq, &rf);
 	smp_mb(); /* Pairing determined by caller's synchronization design. */
+
 	return t;
 }
 
@@ -4744,6 +4828,10 @@ late_initcall(sched_core_sysctl_init);
  */
 int sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
+#ifdef CONFIG_HMBIRD_SCHED
+	int ret;
+#endif
+
 	trace_android_rvh_sched_fork(p);
 
 	__sched_fork(clone_flags, p);
@@ -4782,14 +4870,29 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 		 */
 		p->sched_reset_on_fork = 0;
 	}
+#ifdef CONFIG_HMBIRD_SCHED
+	ret = scx_pre_fork(p);
+	if (ret)
+		goto out_cancel;
 
+	if (dl_prio(p->prio)) {
+		ret = -EAGAIN;
+		goto out_cancel;
+	} else if (task_on_scx(p)) {
+                p->sched_class = &ext_sched_class;
+        } else if (rt_prio(p->prio)) {
+		p->sched_class = &rt_sched_class;
+	} else {
+		p->sched_class = &fair_sched_class;
+	}
+#else
 	if (dl_prio(p->prio))
 		return -EAGAIN;
 	else if (rt_prio(p->prio))
 		p->sched_class = &rt_sched_class;
 	else
 		p->sched_class = &fair_sched_class;
-
+#endif
 	init_entity_runnable_average(&p->se);
 	trace_android_rvh_finish_prio_fork(p);
 
@@ -4807,6 +4910,12 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	RB_CLEAR_NODE(&p->pushable_dl_tasks);
 #endif
 	return 0;
+
+#ifdef CONFIG_HMBIRD_SCHED
+out_cancel:
+	scx_cancel_fork(p);
+	return ret;
+#endif
 }
 
 void sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
@@ -4836,11 +4945,24 @@ void sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
 	if (p->sched_class->task_fork)
 		p->sched_class->task_fork(p);
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+#ifdef CONFIG_HMBIRD_SCHED
+	scx_fork(p);
+#endif
 }
+
+#ifdef CONFIG_HMBIRD_SCHED
+void sched_cancel_fork(struct task_struct *p)
+{
+	scx_cancel_fork(p);
+}
+#endif
 
 void sched_post_fork(struct task_struct *p)
 {
 	uclamp_post_fork(p);
+#ifdef CONFIG_HMBIRD_SCHED
+	scx_post_fork(p);
+#endif
 }
 
 unsigned long to_ratio(u64 period, u64 runtime)
@@ -5664,7 +5786,7 @@ void scheduler_tick(void)
 {
 	int cpu = smp_processor_id();
 	struct rq *rq = cpu_rq(cpu);
-	struct task_struct *curr = rq->curr;
+	struct task_struct *curr;
 	struct rq_flags rf;
 	unsigned long thermal_pressure;
 	u64 resched_latency;
@@ -5675,6 +5797,9 @@ void scheduler_tick(void)
 	sched_clock_tick();
 
 	rq_lock(rq, &rf);
+
+	curr = rq->curr;
+	psi_account_irqtime(rq, curr, NULL);
 
 	update_rq_clock(rq);
 	trace_android_rvh_tick_entry(rq);
@@ -5691,14 +5816,21 @@ void scheduler_tick(void)
 
 	if (sched_feat(LATENCY_WARN) && resched_latency)
 		resched_latency_warn(cpu, resched_latency);
-
+#ifdef CONFIG_HMBIRD_SCHED
+	scx_notify_sched_tick();
+#endif
 	perf_event_task_tick();
 
 #ifdef CONFIG_SMP
-	rq->idle_balance = idle_cpu(cpu);
-	trigger_load_balance(rq);
+#ifdef CONFIG_HMBIRD_SCHED
+	if (!scx_enabled()) {
 #endif
-
+		rq->idle_balance = idle_cpu(cpu);
+		trigger_load_balance(rq);
+#ifdef CONFIG_HMBIRD_SCHED
+	}
+#endif
+#endif
 	trace_android_vh_scheduler_tick(rq);
 }
 
@@ -6008,7 +6140,11 @@ static void put_prev_task_balance(struct rq *rq, struct task_struct *prev,
 	 * We can terminate the balance pass as soon as we know there is
 	 * a runnable task of @class priority or higher.
 	 */
+#ifdef CONFIG_HMBIRD_SCHED
+	for_balance_class_range(class, prev->sched_class, &idle_sched_class) {
+#else
 	for_class_range(class, prev->sched_class, &idle_sched_class) {
+#endif
 		if (class->balance(rq, prev, rf))
 			break;
 	}
@@ -6026,6 +6162,10 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	const struct sched_class *class;
 	struct task_struct *p;
 
+#ifdef CONFIG_HMBIRD_SCHED
+	if (scx_enabled())
+		goto restart;
+#endif
 	/*
 	 * Optimization: we know that if all tasks are in the fair class we can
 	 * call that function directly, but only if the @prev task wasn't of a
@@ -6051,11 +6191,21 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 restart:
 	put_prev_task_balance(rq, prev, rf);
 
+#ifdef CONFIG_HMBIRD_SCHED
+	for_each_active_class(class) {
+		p = class->pick_next_task(rq);
+		if (p) {
+			scx_notify_pick_next_task(rq, p, class);
+			return p;
+		}
+	}
+#else
 	for_each_class(class) {
 		p = class->pick_next_task(rq);
 		if (p)
 			return p;
 	}
+#endif
 
 	BUG(); /* The idle class should always have a runnable task. */
 }
@@ -6083,8 +6233,11 @@ static inline struct task_struct *pick_task(struct rq *rq)
 {
 	const struct sched_class *class;
 	struct task_struct *p;
-
+#ifdef CONFIG_HMBIRD_SCHED
+	for_each_active_class(class) {
+#else
 	for_each_class(class) {
+#endif
 		p = class->pick_task(rq);
 		if (p)
 			return p;
@@ -6721,6 +6874,7 @@ static void __sched notrace __schedule(unsigned int sched_mode)
 		++*switch_count;
 
 		migrate_disable_switch(rq, prev);
+		psi_account_irqtime(rq, prev, next);
 		psi_sched_switch(prev, next, !task_on_rq_queued(prev));
 
 		trace_sched_switch(sched_mode & SM_MASK_PREEMPT, prev, next, prev_state);
@@ -7056,12 +7210,29 @@ EXPORT_SYMBOL(default_wake_function);
 
 static void __setscheduler_prio(struct task_struct *p, int prio)
 {
+#ifdef CONFIG_HMBIRD_SCHED
+	bool on_scx = task_on_scx(p);
+
+	if (p->sched_class == &stop_sched_class)
+		;
+	else if (dl_prio(prio))
+		p->sched_class = &dl_sched_class;
+	else if (rt_prio(prio) && on_scx)
+		p->sched_class = &ext_sched_class;
+	else if (rt_prio(prio))
+		p->sched_class = &rt_sched_class;
+	else if (on_scx)
+		p->sched_class = &ext_sched_class;
+	else
+		p->sched_class = &fair_sched_class;
+#else
 	if (dl_prio(prio))
 		p->sched_class = &dl_sched_class;
 	else if (rt_prio(prio))
 		p->sched_class = &rt_sched_class;
 	else
 		p->sched_class = &fair_sched_class;
+#endif
 
 	p->prio = prio;
 }
@@ -7192,8 +7363,10 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	} else {
 		if (dl_prio(oldprio))
 			p->dl.pi_se = &p->dl;
-		if (rt_prio(oldprio))
+		else if (rt_prio(oldprio))
 			p->rt.timeout = 0;
+		else if (!task_has_idle_policy(p))
+			reweight_task(p, prio - MAX_RT_PRIO);
 	}
 
 	__setscheduler_prio(p, prio);
@@ -7643,6 +7816,12 @@ static int user_check_sched_setscheduler(struct task_struct *p,
 	if (p->sched_reset_on_fork && !reset_on_fork)
 		goto req_priv;
 
+	if (!capable(CAP_SYS_NICE)) {
+		/* Can't change util-clamps */
+		if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP)
+			return -EPERM;
+	}
+
 	return 0;
 
 req_priv:
@@ -7665,6 +7844,9 @@ static int __sched_setscheduler(struct task_struct *p,
 	int queue_flags = DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
 	struct rq *rq;
 	bool cpuset_locked = false;
+#ifdef CONFIG_HMBIRD_SCHED
+	unsigned long flags;
+#endif
 
 	/* The pi code expects interrupts enabled */
 	BUG_ON(pi && in_interrupt());
@@ -7730,6 +7912,9 @@ recheck:
 	 * To be able to change p->policy safely, the appropriate
 	 * runqueue lock must be held.
 	 */
+#ifdef CONFIG_HMBIRD_SCHED
+	spin_lock_irqsave(&scx_tasks_lock, flags);
+#endif
 	rq = task_rq_lock(p, &rf);
 	update_rq_clock(rq);
 
@@ -7741,6 +7926,11 @@ recheck:
 		goto unlock;
 	}
 
+#ifdef CONFIG_HMBIRD_SCHED
+	retval = scx_check_setscheduler(p, policy);
+	if (retval)
+		goto unlock;
+#endif
 	/*
 	 * If not changing anything there's no need to proceed further,
 	 * but store a possible modification of reset_on_fork.
@@ -7797,6 +7987,9 @@ change:
 	if (unlikely(oldpolicy != -1 && oldpolicy != p->policy)) {
 		policy = oldpolicy = -1;
 		task_rq_unlock(rq, p, &rf);
+#ifdef CONFIG_HMBIRD_SCHED
+		spin_unlock_irqrestore(&scx_tasks_lock, flags);
+#endif
 		if (cpuset_locked)
 			cpuset_unlock();
 		goto recheck;
@@ -7864,7 +8057,9 @@ change:
 	preempt_disable();
 	head = splice_balance_callbacks(rq);
 	task_rq_unlock(rq, p, &rf);
-
+#ifdef CONFIG_HMBIRD_SCHED
+	spin_unlock_irqrestore(&scx_tasks_lock, flags);
+#endif
 	if (pi) {
 		if (cpuset_locked)
 			cpuset_unlock();
@@ -7879,6 +8074,9 @@ change:
 
 unlock:
 	task_rq_unlock(rq, p, &rf);
+#ifdef CONFIG_HMBIRD_SCHED
+	spin_unlock_irqrestore(&scx_tasks_lock, flags);
+#endif
 	if (cpuset_locked)
 		cpuset_unlock();
 	return retval;
@@ -9007,6 +9205,9 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
 	case SCHED_NORMAL:
 	case SCHED_BATCH:
 	case SCHED_IDLE:
+#ifdef CONFIG_HMBIRD_SCHED
+	case SCHED_EXT:
+#endif
 		ret = 0;
 		break;
 	}
@@ -9034,6 +9235,9 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
 	case SCHED_NORMAL:
 	case SCHED_BATCH:
 	case SCHED_IDLE:
+#ifdef CONFIG_HMBIRD_SCHED
+	case SCHED_EXT:
+#endif
 		ret = 0;
 	}
 	return ret;
@@ -9615,6 +9819,22 @@ static int cpuset_cpu_inactive(unsigned int cpu)
 	return 0;
 }
 
+static inline void sched_smt_present_inc(int cpu)
+{
+#ifdef CONFIG_SCHED_SMT
+	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
+		static_branch_inc_cpuslocked(&sched_smt_present);
+#endif
+}
+
+static inline void sched_smt_present_dec(int cpu)
+{
+#ifdef CONFIG_SCHED_SMT
+	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
+		static_branch_dec_cpuslocked(&sched_smt_present);
+#endif
+}
+
 int sched_cpu_activate(unsigned int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
@@ -9626,13 +9846,10 @@ int sched_cpu_activate(unsigned int cpu)
 	 */
 	balance_push_set(cpu, false);
 
-#ifdef CONFIG_SCHED_SMT
 	/*
 	 * When going up, increment the number of cores with SMT present.
 	 */
-	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
-		static_branch_inc_cpuslocked(&sched_smt_present);
-#endif
+	sched_smt_present_inc(cpu);
 	set_cpu_active(cpu, true);
 
 	if (sched_smp_initialized) {
@@ -9702,13 +9919,12 @@ int sched_cpu_deactivate(unsigned int cpu)
 	}
 	rq_unlock_irqrestore(rq, &rf);
 
-#ifdef CONFIG_SCHED_SMT
 	/*
 	 * When going down, decrement the number of cores with SMT present.
 	 */
-	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
-		static_branch_dec_cpuslocked(&sched_smt_present);
+	sched_smt_present_dec(cpu);
 
+#ifdef CONFIG_SCHED_SMT
 	sched_core_cpu_deactivate(cpu);
 #endif
 
@@ -9718,6 +9934,7 @@ int sched_cpu_deactivate(unsigned int cpu)
 	sched_update_numa(cpu, false);
 	ret = cpuset_cpu_inactive(cpu);
 	if (ret) {
+		sched_smt_present_inc(cpu);
 		balance_push_set(cpu, false);
 		set_cpu_active(cpu, true);
 		sched_update_numa(cpu, true);
@@ -9890,6 +10107,16 @@ void __init sched_init(void)
 	int i;
 
 	/* Make sure the linker didn't screw up */
+#ifdef CONFIG_HMBIRD_SCHED
+#ifdef CONFIG_SMP
+	WARN_ON_ONCE(!sched_class_above(&stop_sched_class, &dl_sched_class));
+#endif
+	WARN_ON_ONCE(!sched_class_above(&dl_sched_class, &rt_sched_class));
+	WARN_ON_ONCE(!sched_class_above(&rt_sched_class, &fair_sched_class));
+	WARN_ON_ONCE(!sched_class_above(&fair_sched_class, &idle_sched_class));
+	WARN_ON_ONCE(!sched_class_above(&fair_sched_class, &ext_sched_class));
+	WARN_ON_ONCE(!sched_class_above(&ext_sched_class, &idle_sched_class));
+#else
 	BUG_ON(&idle_sched_class != &fair_sched_class + 1 ||
 	       &fair_sched_class != &rt_sched_class + 1 ||
 	       &rt_sched_class   != &dl_sched_class + 1);
@@ -9897,6 +10124,7 @@ void __init sched_init(void)
 	BUG_ON(&dl_sched_class != &stop_sched_class + 1);
 #endif
 
+#endif
 	wait_bit_init();
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -10064,7 +10292,9 @@ void __init sched_init(void)
 	balance_push_set(smp_processor_id(), false);
 #endif
 	init_sched_fair_class();
-
+#ifdef CONFIG_HMBIRD_SCHED
+	init_sched_ext_class();
+#endif
 	psi_init();
 
 	init_uclamp();
@@ -10473,6 +10703,10 @@ void sched_move_task(struct task_struct *tsk)
 	struct rq_flags rf;
 	struct rq *rq;
 
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+	schedtune_attach(tsk);
+#endif
+
 	rq = task_rq_lock(tsk, &rf);
 	update_rq_clock(rq);
 
@@ -10513,6 +10747,9 @@ cpu_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 	struct task_group *tg;
 
 	if (!parent) {
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+		schedtune_root_alloc();
+#endif
 		/* This is early initialization for the top cgroup */
 		return &root_task_group.css;
 	}
@@ -10520,6 +10757,10 @@ cpu_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 	tg = sched_create_group(parent);
 	if (IS_ERR(tg))
 		return ERR_PTR(-ENOMEM);
+
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+	schedtune_alloc(tg, parent_css);
+#endif
 
 	return &tg->css;
 }
@@ -10529,6 +10770,13 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 {
 	struct task_group *tg = css_tg(css);
 	struct task_group *parent = css_tg(css->parent);
+#ifdef CONFIG_HMBIRD_SCHED
+	int ret;
+
+	ret = scx_tg_online(tg);
+	if (ret)
+		return ret;
+#endif
 
 	if (parent)
 		sched_online_group(tg, parent);
@@ -10561,6 +10809,9 @@ static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
 	 * Relies on the RCU grace period between css_released() and this.
 	 */
 	sched_unregister_group(tg);
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+	schedtune_free(css);
+#endif
 }
 
 #ifdef CONFIG_RT_GROUP_SCHED
@@ -10577,13 +10828,69 @@ static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
 }
 #endif
 
+#ifdef CONFIG_HMBIRD_SCHED
+static int cgroup_write_scx_deadline(struct cgroup_subsys_state *css,
+					  struct cftype *cftype, u64 dl)
+{
+	struct task_group *tg;
+	int i;
+
+	for (i = MIN_CGROUP_DL_IDX; i < MAX_GLOBAL_DSQS; ++i) {
+		if (dl < SCX_BPF_DSQS_DEADLINE[i])
+			break;
+	}
+
+	i = max_t(int, i-1, MIN_CGROUP_DL_IDX);
+
+	tg = css_tg(css);
+	tg->scx_deadline_idx = i;
+
+	return 0;
+}
+
+static u64 cgroup_read_scx_deadline(struct cgroup_subsys_state *css,
+					  struct cftype *cft)
+{
+	struct task_group *tg = css_tg(css);
+	int i;
+
+	i = min_t(int, tg->scx_deadline_idx, MAX_GLOBAL_DSQS-1);
+	if (i < 0) {
+		pr_err("<sched_ext> <cgroup_read_scx_deadline> i is %d, less than 0, name is %s\n",
+			i, css->cgroup->kn->name);
+		i = DEFAULT_CGROUP_DL_IDX;
+	}
+
+	return (u64) SCX_BPF_DSQS_DEADLINE[i];
+}
+
+static void scx_change_rt_sched_prop(struct cgroup_subsys_state *css, struct task_struct *p, int prio)
+{
+	if (!css || !rt_prio(prio))
+		return;
+
+	if (!(sched_get_sched_prop(p) & SCHED_PROP_DEADLINE_MASK)) {
+		if (!strcmp(css->cgroup->kn->name, "display"))
+			sched_set_sched_prop(p, SCHED_PROP_DEADLINE_LEVEL3);
+		else if (!strcmp(css->cgroup->kn->name, "touch"))
+			sched_set_sched_prop(p, SCHED_PROP_DEADLINE_LEVEL2);
+		else if (!strcmp(css->cgroup->kn->name, "multimedia"))
+			sched_set_sched_prop(p, SCHED_PROP_DEADLINE_LEVEL1);
+	}
+}
+#endif
+
 static void cpu_cgroup_attach(struct cgroup_taskset *tset)
 {
 	struct task_struct *task;
 	struct cgroup_subsys_state *css;
 
-	cgroup_taskset_for_each(task, css, tset)
+	cgroup_taskset_for_each(task, css, tset) {
+#ifdef CONFIG_HMBIRD_SCHED
+		scx_change_rt_sched_prop(css, task, task->prio);
+#endif
 		sched_move_task(task);
+	}
 
 	trace_android_rvh_cpu_cgroup_attach(tset);
 }
@@ -11233,6 +11540,20 @@ static struct cftype cpu_legacy_files[] = {
 		.write_u64 = cpu_uclamp_ls_write_u64,
 	},
 #endif
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+	{
+		.name = "schedtune.boost",
+		.read_s64 = schedtune_boost_read,
+		.write_s64 = schedtune_boost_write,
+	},
+#endif
+#ifdef CONFIG_HMBIRD_SCHED
+	{
+		.name = "scx.deadline",
+		.read_u64 = cgroup_read_scx_deadline,
+		.write_u64 = cgroup_write_scx_deadline,
+	},
+#endif
 	{ }	/* Terminate */
 };
 
@@ -11371,7 +11692,7 @@ static ssize_t cpu_max_write(struct kernfs_open_file *of,
 {
 	struct task_group *tg = css_tg(of_css(of));
 	u64 period = tg_get_cfs_period(tg);
-	u64 burst = tg_get_cfs_burst(tg);
+	u64 burst = tg->cfs_bandwidth.burst;
 	u64 quota;
 	int ret;
 
@@ -11437,6 +11758,14 @@ static struct cftype cpu_files[] = {
 		.write_u64 = cpu_uclamp_ls_write_u64,
 	},
 #endif
+#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
+	{
+		.name = "schedtune.boost",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_s64 = schedtune_boost_read,
+		.write_s64 = schedtune_boost_write,
+	},
+#endif
 	{ }	/* terminate */
 };
 
@@ -11455,7 +11784,6 @@ struct cgroup_subsys cpu_cgrp_subsys = {
 	.early_init	= true,
 	.threaded	= true,
 };
-
 #endif	/* CONFIG_CGROUP_SCHED */
 
 void dump_cpu_task(int cpu)
